@@ -1,12 +1,19 @@
 export type Role = 'user' | 'admin';
 
+export type AuthProvider = 'email' | 'google' | 'apple';
+
 export type User = {
   id: string;
   name: string;
   email: string;
-  passwordHash: string;
+  passwordHash?: string;
   role: Role;
+  provider: AuthProvider;
+  providerUserId?: string;
+  avatar?: string;
+  emailVerified: boolean;
   createdAt: string;
+  updatedAt: string;
 };
 
 export type PublicUser = Omit<User, 'passwordHash'>;

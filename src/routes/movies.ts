@@ -1,4 +1,4 @@
-import {Router} from 'express';
+import {Router, type NextFunction, type Request, type Response} from 'express';
 import {z} from 'zod';
 import {db} from '../data/store';
 import {requireAdmin, requireAuth} from '../middleware/auth';
@@ -34,58 +34,104 @@ const movieInputSchema = z.object({
   featured: z.boolean().optional(),
 });
 
-router.get('/', (req, res) => {
-  const {q, genre, featured} = req.query as {q?: string; genre?: string; featured?: string};
-  let list = db.listMovies();
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    fn(req, res, next).catch(next);
+  };
+}
 
-  if (q) {
-    const query = q.toLowerCase();
-    list = list.filter(
-      m =>
-        m.title.toLowerCase().includes(query) ||
-        m.director.toLowerCase().includes(query) ||
-        m.cast.some(c => c.toLowerCase().includes(query)),
-    );
-  }
-  if (genre) {
-    list = list.filter(m => m.genres.includes(genre as any));
-  }
-  if (featured === 'true') {
-    list = list.filter(m => m.featured);
-  }
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    const {q, genre, featured} = req.query as {
+      q?: string;
+      genre?: string;
+      featured?: string;
+    };
+    let list = await db.listMovies();
 
-  res.json({movies: list});
-});
+    if (q) {
+      const query = q.toLowerCase();
+      list = list.filter(
+        m =>
+          m.title.toLowerCase().includes(query) ||
+          m.director.toLowerCase().includes(query) ||
+          m.cast.some(c => c.toLowerCase().includes(query)),
+      );
+    }
+    if (genre) {
+      list = list.filter(m => m.genres.includes(genre as any));
+    }
+    if (featured === 'true') {
+      list = list.filter(m => m.featured);
+    }
 
-router.get('/:id', (req, res) => {
-  const movie = db.getMovie(String(req.params.id));
-  if (!movie) return res.status(404).json({error: 'Movie not found'});
-  return res.json({movie});
-});
+    res.json({movies: list});
+  }),
+);
 
-router.post('/', requireAuth, requireAdmin, (req, res) => {
-  const parsed = movieInputSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({error: 'Invalid input', details: parsed.error.flatten()});
-  }
-  const movie = db.createMovie({...parsed.data, cast: parsed.data.cast ?? []});
-  return res.status(201).json({movie});
-});
+router.get(
+  '/:id',
+  asyncHandler(async (req, res) => {
+    const movie = await db.getMovie(String(req.params.id));
+    if (!movie) {
+      return res.status(404).json({error: 'Movie not found'});
+    }
+    return res.json({movie});
+  }),
+);
 
-router.patch('/:id', requireAuth, requireAdmin, (req, res) => {
-  const parsed = movieInputSchema.partial().safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({error: 'Invalid input', details: parsed.error.flatten()});
-  }
-  const movie = db.updateMovie(String(req.params.id), parsed.data);
-  if (!movie) return res.status(404).json({error: 'Movie not found'});
-  return res.json({movie});
-});
+router.post(
+  '/',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const parsed = movieInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res
+        .status(400)
+        .json({error: 'Invalid input', details: parsed.error.flatten()});
+    }
+    const movie = await db.createMovie({
+      ...parsed.data,
+      cast: parsed.data.cast ?? [],
+    });
+    return res.status(201).json({movie});
+  }),
+);
 
-router.delete('/:id', requireAuth, requireAdmin, (req, res) => {
-  const ok = db.deleteMovie(String(req.params.id));
-  if (!ok) return res.status(404).json({error: 'Movie not found'});
-  return res.status(204).send();
-});
+router.patch(
+  '/:id',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const parsed = movieInputSchema.partial().safeParse(req.body);
+    if (!parsed.success) {
+      return res
+        .status(400)
+        .json({error: 'Invalid input', details: parsed.error.flatten()});
+    }
+    const movie = await db.updateMovie(String(req.params.id), parsed.data);
+    if (!movie) {
+      return res.status(404).json({error: 'Movie not found'});
+    }
+    return res.json({movie});
+  }),
+);
+
+router.delete(
+  '/:id',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const ok = await db.deleteMovie(String(req.params.id));
+    if (!ok) {
+      return res.status(404).json({error: 'Movie not found'});
+    }
+    return res.status(204).send();
+  }),
+);
 
 export default router;

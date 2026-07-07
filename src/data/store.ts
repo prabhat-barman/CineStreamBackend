@@ -1,126 +1,248 @@
 import bcrypt from 'bcryptjs';
 import {env} from '../lib/env';
-import type {Movie, User} from '../lib/types';
+import type {AuthProvider, Movie, User} from '../lib/types';
+import {UserModel, type UserDoc} from '../db/models/User';
+import {MovieModel, type MovieDoc} from '../db/models/Movie';
 import {seedMovies} from './seed-movies';
 
-const users = new Map<string, User>();
-const movies = new Map<string, Movie>();
-
-function randomId(prefix: string) {
-  return `${prefix}_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+function userDocToUser(doc: UserDoc): User {
+  return {
+    id: doc._id.toString(),
+    name: doc.name,
+    email: doc.email,
+    passwordHash: doc.passwordHash ?? undefined,
+    role: doc.role as User['role'],
+    provider: (doc.provider as AuthProvider) ?? 'email',
+    providerUserId: doc.providerUserId ?? undefined,
+    avatar: doc.avatar ?? undefined,
+    emailVerified: doc.emailVerified ?? false,
+    createdAt: doc.get('createdAt').toISOString(),
+    updatedAt: doc.get('updatedAt').toISOString(),
+  };
 }
 
-function seedAdmin() {
+function movieDocToMovie(doc: MovieDoc): Movie {
+  return {
+    id: doc._id.toString(),
+    title: doc.title,
+    year: doc.year,
+    rating: doc.rating,
+    match: doc.match,
+    runtimeMin: doc.runtimeMin,
+    genres: doc.genres as Movie['genres'],
+    poster: doc.poster,
+    backdrop: doc.backdrop,
+    synopsis: doc.synopsis,
+    cast: doc.cast,
+    director: doc.director,
+    maturity: doc.maturity,
+    featured: doc.featured ?? false,
+    createdAt: doc.get('createdAt').toISOString(),
+    updatedAt: doc.get('updatedAt').toISOString(),
+  };
+}
+
+async function upsertAdmin(): Promise<void> {
   const email = env.adminEmail.toLowerCase();
-  if ([...users.values()].some(u => u.email === email)) return;
-  const admin: User = {
-    id: randomId('usr'),
+  const existing = await UserModel.findOne({email}).lean();
+  if (existing) {
+    return;
+  }
+  await UserModel.create({
     name: 'CineStream Admin',
     email,
     passwordHash: bcrypt.hashSync(env.adminPassword, 10),
     role: 'admin',
-    createdAt: new Date().toISOString(),
-  };
-  users.set(admin.id, admin);
+  });
 }
 
-function seedDemoUser() {
+async function upsertDemoUser(): Promise<void> {
   const email = 'demo@cinestream.app';
-  if ([...users.values()].some(u => u.email === email)) return;
-  const demo: User = {
-    id: randomId('usr'),
+  const existing = await UserModel.findOne({email}).lean();
+  if (existing) {
+    return;
+  }
+  await UserModel.create({
     name: 'Demo Viewer',
     email,
     passwordHash: bcrypt.hashSync('demo123', 10),
     role: 'user',
-    createdAt: new Date().toISOString(),
-  };
-  users.set(demo.id, demo);
+  });
 }
 
-function seedMoviesOnce() {
-  if (movies.size > 0) return;
-  for (const m of seedMovies) {
-    movies.set(m.id, {...m});
+async function seedMoviesOnce(): Promise<void> {
+  const count = await MovieModel.estimatedDocumentCount();
+  if (count > 0) {
+    return;
   }
+  const docs = seedMovies.map(({id: _id, createdAt: _c, updatedAt: _u, ...rest}) => rest);
+  await MovieModel.insertMany(docs, {ordered: false});
 }
 
 export const db = {
-  init() {
-    seedAdmin();
-    seedDemoUser();
-    seedMoviesOnce();
+  async init(): Promise<void> {
+    await upsertAdmin();
+    await upsertDemoUser();
+    await seedMoviesOnce();
   },
 
   // ---------- Users ----------
-  createUser(input: {name: string; email: string; password: string}): User {
+  async createUser(input: {
+    name: string;
+    email: string;
+    password: string;
+  }): Promise<User> {
     const email = input.email.toLowerCase();
-    const exists = [...users.values()].find(u => u.email === email);
-    if (exists) throw new Error('EMAIL_TAKEN');
-    const user: User = {
-      id: randomId('usr'),
+    const exists = await UserModel.findOne({email}).lean();
+    if (exists) {
+      throw new Error('EMAIL_TAKEN');
+    }
+    try {
+      const doc = await UserModel.create({
+        name: input.name,
+        email,
+        passwordHash: bcrypt.hashSync(input.password, 10),
+        role: 'user',
+        provider: 'email',
+        emailVerified: false,
+      });
+      return userDocToUser(doc);
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        'code' in err &&
+        (err as unknown as {code: number}).code === 11000
+      ) {
+        throw new Error('EMAIL_TAKEN');
+      }
+      throw err;
+    }
+  },
+
+  async upsertSocialUser(input: {
+    provider: 'google' | 'apple';
+    providerUserId: string;
+    email: string;
+    name: string;
+    avatar?: string;
+    emailVerified: boolean;
+  }): Promise<User> {
+    const email = input.email.toLowerCase();
+
+    // Prefer provider match first (handles email changes on Apple's side)
+    const byProvider = await UserModel.findOne({
+      provider: input.provider,
+      providerUserId: input.providerUserId,
+    });
+    if (byProvider) {
+      let dirty = false;
+      if (input.email && byProvider.email !== email) {
+        byProvider.email = email;
+        dirty = true;
+      }
+      if (input.avatar && byProvider.avatar !== input.avatar) {
+        byProvider.avatar = input.avatar;
+        dirty = true;
+      }
+      if (input.emailVerified && !byProvider.emailVerified) {
+        byProvider.emailVerified = true;
+        dirty = true;
+      }
+      if (dirty) {
+        await byProvider.save();
+      }
+      return userDocToUser(byProvider);
+    }
+
+    // Fall back to email match — link the social identity to the existing account.
+    const byEmail = await UserModel.findOne({email});
+    if (byEmail) {
+      byEmail.provider = input.provider;
+      byEmail.providerUserId = input.providerUserId;
+      byEmail.emailVerified = byEmail.emailVerified || input.emailVerified;
+      if (input.avatar) {
+        byEmail.avatar = input.avatar;
+      }
+      await byEmail.save();
+      return userDocToUser(byEmail);
+    }
+
+    // Otherwise create a brand-new social account.
+    const doc = await UserModel.create({
       name: input.name,
       email,
-      passwordHash: bcrypt.hashSync(input.password, 10),
+      provider: input.provider,
+      providerUserId: input.providerUserId,
+      avatar: input.avatar,
+      emailVerified: input.emailVerified,
       role: 'user',
-      createdAt: new Date().toISOString(),
-    };
-    users.set(user.id, user);
-    return user;
+    });
+    return userDocToUser(doc);
   },
-  findUserByEmail(email: string): User | undefined {
-    const e = email.toLowerCase();
-    return [...users.values()].find(u => u.email === e);
+
+  async findUserByEmail(email: string): Promise<User | undefined> {
+    const doc = await UserModel.findOne({email: email.toLowerCase()});
+    return doc ? userDocToUser(doc) : undefined;
   },
-  findUserById(id: string): User | undefined {
-    return users.get(id);
+
+  async findUserById(id: string): Promise<User | undefined> {
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+      return undefined;
+    }
+    const doc = await UserModel.findById(id);
+    return doc ? userDocToUser(doc) : undefined;
   },
-  listUsers(): User[] {
-    return [...users.values()].sort((a, b) =>
-      a.createdAt < b.createdAt ? 1 : -1,
-    );
+
+  async listUsers(): Promise<User[]> {
+    const docs = await UserModel.find().sort({createdAt: -1});
+    return docs.map(userDocToUser);
   },
-  deleteUser(id: string): boolean {
-    return users.delete(id);
+
+  async deleteUser(id: string): Promise<boolean> {
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+      return false;
+    }
+    const res = await UserModel.deleteOne({_id: id});
+    return res.deletedCount > 0;
   },
 
   // ---------- Movies ----------
-  listMovies(): Movie[] {
-    return [...movies.values()].sort((a, b) =>
-      a.createdAt < b.createdAt ? 1 : -1,
-    );
+  async listMovies(): Promise<Movie[]> {
+    const docs = await MovieModel.find().sort({createdAt: -1});
+    return docs.map(movieDocToMovie);
   },
-  getMovie(id: string): Movie | undefined {
-    return movies.get(id);
+
+  async getMovie(id: string): Promise<Movie | undefined> {
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+      return undefined;
+    }
+    const doc = await MovieModel.findById(id);
+    return doc ? movieDocToMovie(doc) : undefined;
   },
-  createMovie(input: Omit<Movie, 'id' | 'createdAt' | 'updatedAt'>): Movie {
-    const now = new Date().toISOString();
-    const movie: Movie = {
-      ...input,
-      id: randomId('mov'),
-      createdAt: now,
-      updatedAt: now,
-    };
-    movies.set(movie.id, movie);
-    return movie;
+
+  async createMovie(
+    input: Omit<Movie, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<Movie> {
+    const doc = await MovieModel.create(input);
+    return movieDocToMovie(doc);
   },
-  updateMovie(
+
+  async updateMovie(
     id: string,
     patch: Partial<Omit<Movie, 'id' | 'createdAt' | 'updatedAt'>>,
-  ): Movie | undefined {
-    const existing = movies.get(id);
-    if (!existing) return undefined;
-    const updated: Movie = {
-      ...existing,
-      ...patch,
-      updatedAt: new Date().toISOString(),
-    };
-    movies.set(id, updated);
-    return updated;
+  ): Promise<Movie | undefined> {
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+      return undefined;
+    }
+    const doc = await MovieModel.findByIdAndUpdate(id, patch, {new: true});
+    return doc ? movieDocToMovie(doc) : undefined;
   },
-  deleteMovie(id: string): boolean {
-    return movies.delete(id);
+
+  async deleteMovie(id: string): Promise<boolean> {
+    if (!/^[a-f\d]{24}$/i.test(id)) {
+      return false;
+    }
+    const res = await MovieModel.deleteOne({_id: id});
+    return res.deletedCount > 0;
   },
 };
-
-db.init();
